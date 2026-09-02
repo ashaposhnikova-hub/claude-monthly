@@ -16,11 +16,17 @@
  *   node ~/.claude/skills/monthly/monthly.mjs --month 2026-08 --out "~/Documents/отчёт.txt"
  *   node ~/.claude/skills/monthly/monthly.mjs --dry-run       # только статистика, без файла
  *   node ~/.claude/skills/monthly/monthly.mjs --name "Иванов Егор"
+ *   node ~/.claude/skills/monthly/monthly.mjs --no-zip        # без архива сессий для бота Hive
+ *
+ * Рядом с .txt кладёт архив «Сессии Claude Code — <месяц>.zip»: ужатые .jsonl всех сессий месяца
+ * (без «размышлений» и длинных выводов инструментов). Его можно отправить боту Hive @kg_export_bot —
+ * тогда отчёт появится и в Hive → Coding → «Мой отчёт». Архив режется на части до 45 МБ.
  */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import zlib from "node:zlib";
 
 const HOME = os.homedir();
 const PROJECTS_DIR = path.join(HOME, ".claude", "projects");
@@ -28,6 +34,7 @@ const GAP_LIMIT_MS = 30 * 60 * 1000;      // пауза >30 мин не счит
 const MAX_PROMPTS_PER_SESSION = 8;
 const PROMPT_CHARS = 220;
 const RECAP_CHARS = 500;
+const ZIP_PART_LIMIT = 45 * 1024 * 1024;   // бот Hive принимает архивы до 50 МБ
 
 // ───────────── аргументы ─────────────
 const argv = process.argv.slice(2);
@@ -51,6 +58,7 @@ const WEEKDAYS_RU = ["вс","пн","вт","ср","чт","пт","сб"];
 const monthTitle = `${MONTHS_RU[M - 1]} ${Y}`;
 const employeeName = getOpt("--name") || "";
 const dryRun = has("--dry-run");
+const makeZip = !has("--no-zip");
 const outArg = getOpt("--out");
 const outPath = outArg
   ? path.resolve(outArg.replace(/^~(?=$|\/)/, HOME))
@@ -111,6 +119,71 @@ function detectDomains(...sources) {
   return [...found];
 }
 
+// ───────────── ужатая копия строки сессии для бота Hive ─────────────
+// Парсер Hive читает только type/timestamp/sessionId/cwd/gitBranch и message.content:
+// текст, tool_use (имя + file_path/command), tool_result (обрезает до 400 символов).
+// «Размышления» и длинные выводы инструментов ему не нужны — выбрасываем, это и даёт 1,9 ГБ → 15 МБ.
+const clip = (v, n) => (typeof v === "string" && v.length > n ? v.slice(0, n) + "…" : v);
+function slimLine(o) {
+  const out = {};
+  for (const k of ["type", "timestamp", "sessionId", "cwd", "gitBranch", "uuid", "parentUuid"]) if (o[k] !== undefined) out[k] = o[k];
+  const m = o.message || {};
+  let content = m.content;
+  if (Array.isArray(content)) {
+    const blocks = [];
+    for (const b of content) {
+      if (!b || typeof b !== "object") continue;
+      if (b.type === "text") blocks.push({ type: "text", text: clip(b.text || "", 4000) });
+      else if (b.type === "tool_use") {
+        const inp = b.input || {}, small = {};
+        for (const k of ["command", "file_path", "skill", "pattern", "url", "description", "query", "prompt"]) if (inp[k] !== undefined) small[k] = clip(inp[k], 200);
+        blocks.push({ type: "tool_use", id: b.id, name: b.name, input: small });
+      } else if (b.type === "tool_result") {
+        let c = b.content;
+        if (Array.isArray(c)) c = c.filter(x => x && x.type === "text").map(x => ({ type: "text", text: clip(x.text || "", 300) }));
+        else if (typeof c === "string") c = clip(c, 300);
+        blocks.push({ type: "tool_result", tool_use_id: b.tool_use_id, content: c });
+      }
+    }
+    content = blocks;
+  } else if (typeof content === "string") content = clip(content, 8000);
+  out.message = { role: m.role, content };
+  return redact(JSON.stringify(out));
+}
+
+// ───────────── минимальный ZIP (deflate), без зависимостей ─────────────
+const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(buf) { let c = 0xFFFFFFFF; for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function dosDateTime(d) {
+  const time = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+  const date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  return { time, date };
+}
+/** entries: [{ name, deflated, crc, size }] → пишет zip-файл */
+function writeZip(filePath, entries) {
+  const parts = [], central = []; let offset = 0; const { time, date } = dosDateTime(new Date());
+  for (const e of entries) {
+    const name = Buffer.from(e.name, "utf8");
+    const lh = Buffer.alloc(30);
+    lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(0x0800, 6); lh.writeUInt16LE(8, 8);
+    lh.writeUInt16LE(time, 10); lh.writeUInt16LE(date, 12); lh.writeUInt32LE(e.crc, 14);
+    lh.writeUInt32LE(e.deflated.length, 18); lh.writeUInt32LE(e.size, 22); lh.writeUInt16LE(name.length, 26); lh.writeUInt16LE(0, 28);
+    parts.push(lh, name, e.deflated);
+    const ch = Buffer.alloc(46);
+    ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6); ch.writeUInt16LE(0x0800, 8); ch.writeUInt16LE(8, 10);
+    ch.writeUInt16LE(time, 12); ch.writeUInt16LE(date, 14); ch.writeUInt32LE(e.crc, 16);
+    ch.writeUInt32LE(e.deflated.length, 20); ch.writeUInt32LE(e.size, 24); ch.writeUInt16LE(name.length, 28);
+    ch.writeUInt16LE(0, 30); ch.writeUInt16LE(0, 32); ch.writeUInt16LE(0, 34); ch.writeUInt32LE(0, 36); ch.writeUInt32LE(offset, 42);
+    central.push(ch, name);
+    offset += lh.length + name.length + e.deflated.length;
+  }
+  const cd = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0); eocd.writeUInt16LE(0, 4); eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(entries.length, 8); eocd.writeUInt16LE(entries.length, 10); eocd.writeUInt32LE(cd.length, 12); eocd.writeUInt32LE(offset, 16); eocd.writeUInt16LE(0, 20);
+  fs.writeFileSync(filePath, Buffer.concat([...parts, cd, eocd]));
+}
+
 // ───────────── разбор транскриптов ─────────────
 function localDate(ts) {
   const d = new Date(ts);
@@ -161,13 +234,14 @@ for (const dir of dirs) {
       const sid = o.sessionId || f.replace(/\.jsonl$/, "");
       let s = sessions.get(sid);
       if (!s) {
-        s = { id: sid, dir, cwd: null, branch: null, days: new Map(), prompts: [], tools: {}, skills: new Set(), mcp: new Set(), files: new Set(), recap: "", stamps: [], userStamps: [], userMsgs: 0, asstMsgs: 0, allPromptText: "" };
+        s = { id: sid, dir, cwd: null, branch: null, days: new Map(), prompts: [], tools: {}, skills: new Set(), mcp: new Set(), files: new Set(), recap: "", stamps: [], userStamps: [], userMsgs: 0, asstMsgs: 0, allPromptText: "", slim: [] };
         sessions.set(sid, s);
       }
       if (!s.cwd && o.cwd) s.cwd = o.cwd;
       if (!s.branch && o.gitBranch && o.gitBranch !== "HEAD") s.branch = o.gitBranch;
       s.stamps.push(new Date(ts).getTime());
       s.days.set(day, (s.days.get(day) || 0) + 1);
+      if (makeZip && !dryRun) s.slim.push(slimLine(o));
       const msg = o.message || {};
       const content = msg.content;
       if (o.type === "user" && !o.isMeta && (typeof content === "string" || (Array.isArray(content) && !content.some(b => b && b.type === "tool_result")))) s.userStamps.push(new Date(ts).getTime());
@@ -324,3 +398,26 @@ L.push("Примечание: «Задачи» — ваши запросы к Cl
 fs.mkdirSync(path.dirname(outPath), { recursive: true });
 fs.writeFileSync(outPath, L.join("\n"), "utf8");
 console.log(`Файл: ${outPath} (${Math.round(fs.statSync(outPath).size / 1024)} КБ)`);
+
+if (makeZip) {
+  // одна запись = одна сессия; сортируем по дате начала, режем на части до 45 МБ
+  const items = [...sessions.values()].filter(s => s.slim.length && (s.userMsgs || s.asstMsgs))
+    .sort((a, b) => Math.min(...a.stamps) - Math.min(...b.stamps))
+    .map(s => { const buf = Buffer.from(s.slim.join("\n") + "\n", "utf8"); return { name: `${s.id}.jsonl`, size: buf.length, crc: crc32(buf), deflated: zlib.deflateRawSync(buf, { level: 6 }) }; })
+    .filter(it => it.size >= 2000); // пустые сессии (одно «привет») боту не нужны
+  const partsList = []; let cur = [], curBytes = 0;
+  for (const it of items) {
+    const cost = it.deflated.length + 76 + 2 * it.name.length;
+    if (cur.length && curBytes + cost > ZIP_PART_LIMIT) { partsList.push(cur); cur = []; curBytes = 0; }
+    cur.push(it); curBytes += cost;
+  }
+  if (cur.length) partsList.push(cur);
+  const base = path.join(path.dirname(outPath), `Сессии Claude Code — ${monthTitle}`);
+  const written = [];
+  partsList.forEach((entries, i) => {
+    const f = partsList.length > 1 ? `${base} — часть ${i + 1} из ${partsList.length}.zip` : `${base}.zip`;
+    writeZip(f, entries); written.push(f);
+  });
+  for (const f of written) console.log(`Архив для бота Hive: ${f} (${(fs.statSync(f).size / 1048576).toFixed(1)} МБ, сессий: ${partsList[written.indexOf(f)].length})`);
+  console.log(`Отправьте архив${written.length > 1 ? "ы" : ""} боту @kg_export_bot — отчёт появится и в Hive → Coding → «Мой отчёт».`);
+}
