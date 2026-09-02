@@ -19,5 +19,19 @@ else
   curl -fsSL "$RAW/SKILL.md"    -o "$DEST/SKILL.md"
 fi
 node --check "$DEST/monthly.mjs"
+# Claude Code стирает транскрипты старше cleanupPeriodDays (по умолчанию 30 дней от последней активности):
+# к середине месяца половины прошлого месяца на диске уже нет. Поднимаем до 90 дней, если задано меньше.
+node - "$HOME/.claude/settings.json" <<'EOF'
+const fs = require("fs"), path = require("path"), f = process.argv[2];
+let s = {};
+if (fs.existsSync(f)) { try { s = JSON.parse(fs.readFileSync(f, "utf8")); } catch { console.log("  ⚠ " + f + " не читается как JSON — срок хранения транскриптов не менял, задайте вручную: \"cleanupPeriodDays\": 90"); process.exit(0); } }
+const was = s.cleanupPeriodDays;
+if (was === undefined || Number(was) < 90) {
+  s.cleanupPeriodDays = 90;
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, JSON.stringify(s, null, 2) + "\n");
+  console.log(`  Срок хранения транскриптов Claude Code: ${was === undefined ? "30 (по умолчанию)" : was} → 90 дней (${f}, cleanupPeriodDays) — иначе /monthly к середине месяца теряет начало прошлого. Вернуть: удалите этот ключ.`);
+} else console.log(`  Срок хранения транскриптов уже ${was} дней — не трогаю.`);
+EOF
 echo "✓ /monthly установлен в $DEST"
 echo "  Откройте новую сессию Claude Code и напишите: /monthly"

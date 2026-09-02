@@ -10,6 +10,10 @@
  *
  * Ничего никуда не отправляет. Секреты вырезаются теми же правилами, что в /report.
  *
+ * Claude Code хранит транскрипты cleanupPeriodDays (по умолчанию 30 дней от последней активности)
+ * и удаляет старше. Дни, чьи транскрипты уже стёрты, восстанавливаются из истории ваших запросов
+ * (~/.claude/history.jsonl, она не удаляется): проект, задачи, время — без итогов и инструментов.
+ *
  * Запуск:
  *   node ~/.claude/skills/monthly/monthly.mjs                 # прошлый месяц
  *   node ~/.claude/skills/monthly/monthly.mjs --month 2026-08
@@ -283,6 +287,45 @@ for (const dir of dirs) {
   }
 }
 
+// ───────────── история запросов: дни, чьи транскрипты Claude Code уже стёр ─────────────
+// Claude Code хранит транскрипты cleanupPeriodDays (по умолчанию 30 дней от последней активности), поэтому
+// к середине месяца начало прошлого месяца с диска уже исчезло. История ваших запросов
+// (~/.claude/history.jsonl: текст запроса, время, папка, id сессии) не удаляется — из неё восстанавливаем
+// проект, задачи и время таких сессий. Итогов, инструментов и архива для бота у них нет.
+const HISTORY_FILE = path.join(HOME, ".claude", "history.jsonl");
+const transcriptIds = new Set(sessions.keys());
+let historyEntries = 0;
+try {
+  for (const line of fs.readFileSync(HISTORY_FILE, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    let o; try { o = JSON.parse(line); } catch { continue; }
+    const t = typeof o.timestamp === "number" ? o.timestamp : Date.parse(o.timestamp);
+    if (!t) continue;
+    const day = localDate(t);
+    if (!day.startsWith(month + "-")) continue;
+    const sid = o.sessionId || `history-${day}-${o.project || ""}`;
+    if (transcriptIds.has(sid)) continue; // транскрипт на месте — история не нужна
+    let s = sessions.get(sid);
+    if (!s) {
+      s = { id: sid, dir: null, cwd: o.project || null, branch: null, days: new Map(), prompts: [], tools: {}, skills: new Set(), mcp: new Set(), files: new Set(), recap: "", stamps: [], userStamps: [], userMsgs: 0, asstMsgs: 0, allPromptText: "", slim: [], fromHistory: true };
+      sessions.set(sid, s);
+    }
+    historyEntries++;
+    s.stamps.push(t); s.userStamps.push(t);
+    s.days.set(day, (s.days.get(day) || 0) + 1);
+    const text = typeof o.display === "string" ? o.display : "";
+    const cmd = text.match(/^\s*\/([a-z0-9:_-]+)/i);
+    if (cmd) { s.skills.add(cmd[1]); continue; }
+    if (!text.trim() || NOISE_PREFIX.test(text)) continue;
+    const p = cleanPrompt(text);
+    if (!p) continue;
+    s.userMsgs++;
+    s.allPromptText += " " + p.slice(0, 2000);
+    if (!isInformative(p)) continue;
+    s.prompts.push({ day, text: oneLine(p, PROMPT_CHARS) });
+  }
+} catch {}
+
 // ───────────── агрегация ─────────────
 // Активное время = объединение времени ВАШИХ запросов по всем сессиям за день: параллельные окна не
 // складываются, ночная работа агента без вас не считается, паузы дольше 30 минут не считаются.
@@ -302,6 +345,7 @@ function topDomainsInText(text, limit = 3) {
 function projectNameOf(s) {
   if (s.cwd === HOME) return "~ (домашняя папка)";
   if (s.cwd) return path.basename(s.cwd) || s.cwd;
+  if (!s.dir) return "—";
   return path.basename(s.dir).replace(/^-Users-[^-]+-?/, "").replace(/-/g, "/") || "—";
 }
 
@@ -310,8 +354,10 @@ const byProject = new Map();
 const dayStamps = new Map();      // day -> все метки времени за день (для активного времени)
 const projectDayStamps = new Map(); // project -> day -> метки
 let totalPrompts = 0;
+const transcriptDays = new Set(), historyDays = new Set();
 for (const s of sessions.values()) {
   if (!s.userMsgs && !s.asstMsgs) continue;
+  for (const t of s.userStamps) (s.fromHistory ? historyDays : transcriptDays).add(localDate(t));
   const project = projectNameOf(s);
   const domains = [...new Set([...detectDomains(s.cwd, s.dir, gitRemoteOf(s.cwd)), ...topDomainsInText(s.allPromptText + " " + s.recap)])].slice(0, 4);
   const firstDay = [...s.days.keys()].sort()[0];
@@ -322,7 +368,7 @@ for (const s of sessions.values()) {
     (pd.get(d) || pd.set(d, []).get(d)).push(t);
   }
   const item = {
-    project, domains, branch: s.branch,
+    project, domains, branch: s.branch, fromHistory: !!s.fromHistory,
     prompts: s.prompts.map(p => p.text).slice(0, MAX_PROMPTS_PER_SESSION),
     nPrompts: s.prompts.length,
     recap: oneLine(redact(cleanPrompt(stripMarkdown(s.recap))), RECAP_CHARS),
@@ -342,6 +388,20 @@ for (const [name, pd] of projectDayStamps.entries()) {
 }
 const days = [...byDay.keys()].sort();
 const nSessions = [...byDay.values()].reduce((a, v) => a + v.length, 0);
+const historyOnlyDays = [...historyDays].filter(d => !transcriptDays.has(d)).sort();
+const firstTranscriptDay = [...transcriptDays].sort()[0] || null;
+const fmtDM = (day) => `${day.slice(8, 10)}.${day.slice(5, 7)}`;
+// «01.08–14.08, 20.08» — список дней сжатый в диапазоны
+function dayRanges(list) {
+  const out = []; let a = null, b = null;
+  const next = (d) => { const x = new Date(d + "T12:00:00"); x.setDate(x.getDate() + 1); return localDate(x.getTime()); };
+  for (const d of list) { if (b && next(b) === d) { b = d; continue; } if (a) out.push(a === b ? fmtDM(a) : `${fmtDM(a)}–${fmtDM(b)}`); a = b = d; }
+  if (a) out.push(a === b ? fmtDM(a) : `${fmtDM(a)}–${fmtDM(b)}`);
+  return out.join(", ");
+}
+const coverageNote = historyOnlyDays.length
+  ? `Транскрипты сессий на диске${firstTranscriptDay ? ` — с ${fmtDM(firstTranscriptDay)}` : " за этот месяц отсутствуют"}: Claude Code хранит их 30 дней (cleanupPeriodDays). Дни ${dayRanges(historyOnlyDays)} (${plural(historyOnlyDays.length, "день", "дня", "дней")}) — по истории запросов: задачи и время есть, итогов и инструментов нет.`
+  : "";
 
 const fmtDay = (day) => { const d = new Date(day + "T12:00:00"); return `${String(d.getDate()).padStart(2, "0")} ${MONTHS_RU_GEN[d.getMonth()]} (${WEEKDAYS_RU[d.getDay()]})`; };
 const fmtTime = (d) => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
@@ -349,8 +409,12 @@ const fmtH = (h) => String(Math.round(h * 10) / 10).replace(".", ",");
 
 // ───────────── статистика ─────────────
 console.log(`Месяц: ${monthTitle}`);
-console.log(`Рабочих дней с Claude Code: ${days.length} · сессий: ${nSessions} · ваших запросов: ${totalPrompts} · время работы с Claude Code (оценка): ~${fmtH(totalHours)} ч`);
+console.log(`Рабочих дней с Claude Code: ${dayStamps.size} · сессий: ${nSessions} · ваших запросов: ${totalPrompts} · время работы с Claude Code (оценка): ~${fmtH(totalHours)} ч`);
 console.log(`Проекты: ${[...byProject.keys()].join(", ") || "—"}`);
+if (coverageNote) {
+  console.log(coverageNote);
+  console.log(`Чтобы транскрипты не пропадали, в ~/.claude/settings.json задайте "cleanupPeriodDays": 90 (install.sh делает это сам).`);
+}
 if (!days.length) { console.log("За этот месяц сессий не найдено — файл не создан."); process.exit(0); }
 if (dryRun) { console.log("(--dry-run: файл не записан)"); process.exit(0); }
 
@@ -359,8 +423,9 @@ const L = [];
 L.push(`ОТЧЁТ О РАБОТЕ В CLAUDE CODE — ${monthTitle.toUpperCase()}`);
 if (employeeName) L.push(`Сотрудник: ${employeeName}`);
 L.push(`Сформировано: ${new Date().toLocaleDateString("ru-RU")} командой /monthly из локальных транскриптов сессий`);
+if (coverageNote) L.push(coverageNote);
 L.push("");
-L.push(`ИТОГО ЗА МЕСЯЦ: ${plural(days.length, "рабочий день", "рабочих дня", "рабочих дней")} · ${plural(nSessions, "сессия", "сессии", "сессий")} · ${plural(totalPrompts, "запрос", "запроса", "запросов")} · ~${fmtH(totalHours)} ч работы с Claude Code (оценка по вашим запросам, паузы дольше 30 минут не считаются; это не учёт рабочего времени)`);
+L.push(`ИТОГО ЗА МЕСЯЦ: ${plural(dayStamps.size, "рабочий день", "рабочих дня", "рабочих дней")} · ${plural(nSessions, "сессия", "сессии", "сессий")} · ${plural(totalPrompts, "запрос", "запроса", "запросов")} · ~${fmtH(totalHours)} ч работы с Claude Code (оценка по вашим запросам, паузы дольше 30 минут не считаются; это не учёт рабочего времени)`);
 L.push("");
 L.push("РЕЗЮМЕ МЕСЯЦА");
 L.push("[РЕЗЮМЕ: заполняется при запуске /monthly — 8–15 строк: что сделано по каждому проекту, результаты, цифры]");
@@ -380,7 +445,7 @@ for (const day of days) {
   L.push("");
   L.push(`── ${fmtDay(day)} · ${plural(items.length, "сессия", "сессии", "сессий")} · ~${fmtH(dayHours)} ч${dayDomains.length ? ` · ${dayDomains.join(", ")}` : ""} ──`);
   for (const it of items) {
-    L.push(`${fmtTime(it.start)}–${fmtTime(it.end)} · ${it.project}${it.branch ? ` (ветка ${it.branch})` : ""}${it.domains.length ? ` · ${it.domains.join(", ")}` : ""}`);
+    L.push(`${fmtTime(it.start)}–${fmtTime(it.end)} · ${it.project}${it.branch ? ` (ветка ${it.branch})` : ""}${it.domains.length ? ` · ${it.domains.join(", ")}` : ""}${it.fromHistory ? " · по истории запросов" : ""}`);
     if (it.prompts.length) {
       L.push("  Задачи:");
       for (const p of it.prompts) L.push(`    • ${redact(p)}`);
@@ -393,7 +458,7 @@ for (const day of days) {
   }
 }
 L.push("");
-L.push("Примечание: «Задачи» — ваши запросы к Claude Code в том виде, как вы их писали; «Итог» — последний содержательный ответ в сессии. Секреты и IP-адреса вырезаны автоматически.");
+L.push(`Примечание: «Задачи» — ваши запросы к Claude Code в том виде, как вы их писали; «Итог» — последний содержательный ответ в сессии.${historyOnlyDays.length ? " «По истории запросов» — транскрипт сессии уже удалён Claude Code, восстановлены только запросы и время." : ""} Секреты и IP-адреса вырезаны автоматически.`);
 
 fs.mkdirSync(path.dirname(outPath), { recursive: true });
 fs.writeFileSync(outPath, L.join("\n"), "utf8");
@@ -419,5 +484,7 @@ if (makeZip) {
     writeZip(f, entries); written.push(f);
   });
   for (const f of written) console.log(`Архив для бота Hive: ${f} (${(fs.statSync(f).size / 1048576).toFixed(1)} МБ, сессий: ${partsList[written.indexOf(f)].length})`);
+  const nHist = [...sessions.values()].filter(s => s.fromHistory && (s.userMsgs || s.asstMsgs)).length;
+  if (nHist) console.log(`В архив не вошли ${plural(nHist, "сессия", "сессии", "сессий")} без транскрипта (только история запросов).`);
   console.log(`Отправьте архив${written.length > 1 ? "ы" : ""} боту @kg_export_bot — отчёт появится и в Hive → Coding → «Мой отчёт».`);
 }
