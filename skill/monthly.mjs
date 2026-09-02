@@ -217,7 +217,7 @@ function stripMarkdown(s) {
 const sessions = new Map(); // sessionId -> данные
 let dirs = [];
 try { dirs = fs.readdirSync(PROJECTS_DIR).map(d => path.join(PROJECTS_DIR, d)).filter(p => { try { return fs.statSync(p).isDirectory(); } catch { return false; } }); }
-catch { console.error(`Нет папки ${PROJECTS_DIR} — Claude Code ещё не запускался на этом компьютере?`); process.exit(1); }
+catch { dirs = []; } // папки может не быть, а история запросов — быть; проверка ниже
 
 for (const dir of dirs) {
   let files = [];
@@ -293,6 +293,7 @@ for (const dir of dirs) {
 // (~/.claude/history.jsonl: текст запроса, время, папка, id сессии) не удаляется — из неё восстанавливаем
 // проект, задачи и время таких сессий. Итогов, инструментов и архива для бота у них нет.
 const HISTORY_FILE = path.join(HOME, ".claude", "history.jsonl");
+if (!dirs.length && !fs.existsSync(HISTORY_FILE)) { console.error(`Нет ни ${PROJECTS_DIR}, ни ${HISTORY_FILE} — Claude Code ещё не запускался на этом компьютере?`); process.exit(1); }
 const transcriptIds = new Set(sessions.keys());
 let historyEntries = 0;
 try {
